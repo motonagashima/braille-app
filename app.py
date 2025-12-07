@@ -1,7 +1,7 @@
 import streamlit as st
 import cv2
 import numpy as np
-from PIL import Image, ImageOps # ImageOpsを追加
+from PIL import Image, ImageOps
 from streamlit_cropper import st_cropper
 
 # ページ設定
@@ -12,23 +12,30 @@ st.set_page_config(
 )
 
 # ==========================================
-# 関数: 画像の傾き補正 (Skew Correction)
+# 関数: 画像の傾き補正 (角度制限付き)
 # ==========================================
 def correct_skew(image, contours):
-    # すべての輪郭点を含む最小矩形を取得
     if not contours:
         return image, 0
     
     all_points = np.concatenate(contours)
     rect = cv2.minAreaRect(all_points)
+    
+    # minAreaRectの角度は -90 ~ 0 の範囲で返る仕様
     angle = rect[-1]
     
-    # 角度の正規化
+    # 角度を -45 ~ 45 の範囲に正規化して「水平からのズレ」にする
     if angle < -45:
         angle = -(90 + angle)
     else:
         angle = -angle
         
+    # --- 【修正】過度な回転を禁止 ---
+    # トリム後は情報量が少なく、縦横を間違えやすいため、
+    # 「±10度」以上の急激な回転は誤判定として無視する。
+    if abs(angle) > 10.0:
+        return image, 0
+    
     # わずかな角度なら補正しない（ノイズ対策）
     if abs(angle) < 0.5:
         return image, 0
@@ -69,6 +76,7 @@ def process_braille_image(image_array):
         if 10 < cv2.contourArea(cnt) < 5000:
             dot_contours.append(cnt)
             
+    # 補正実行
     corrected_img, angle = correct_skew(gray_image, dot_contours)
     
     # 補正後の画像で再処理
@@ -76,7 +84,7 @@ def process_braille_image(image_array):
     thresh_corr = cv2.adaptiveThreshold(blurred_corr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
     contours_final, _ = cv2.findContours(thresh_corr, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-    # 3. 本番ドット検出
+    # 3. 本番ドット検出 (白抜き・ハイフン除去)
     raw_dots = []
     radii_list = []
     dot_id_counter = 0
@@ -352,15 +360,13 @@ st.write("画像の点字部分をトリミングして翻訳します。")
 uploaded_file = st.file_uploader("画像ファイルを選択してください", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
+    # --- 【重要】アップロード直後にExif補正を行う ---
     image = Image.open(uploaded_file)
-    
-    # --- 【追加】Exif情報に基づく画像の向き補正 ---
     try:
         image = ImageOps.exif_transpose(image)
-    except Exception as e:
-        print(f"画像の回転補正に失敗しました: {e}")
+    except Exception:
         pass
-    # -------------------------------------------
+    # ---------------------------------------------
 
     st.subheader("1. 範囲指定")
     st.write("翻訳したい点字の部分を枠で囲んでください。")
@@ -380,7 +386,6 @@ if uploaded_file is not None:
                 img_cv = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
 
             with st.spinner("解析中..."):
-                # 処理実行
                 result_img, text, details = process_braille_image(img_cv)
                 
                 st.success("完了！")
