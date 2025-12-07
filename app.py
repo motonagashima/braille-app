@@ -102,7 +102,7 @@ def process_braille_image(image_array):
     
     avg_radius = np.mean([d['radius'] for d in braille_dots])
 
-    # 4. 行の分離 (Y座標クラスタリング)
+    # 4. 行の分離
     braille_dots.sort(key=lambda d: d['center'][1])
     lines_of_dots = []
     if braille_dots:
@@ -112,7 +112,7 @@ def process_braille_image(image_array):
             dot = braille_dots[i]
             dy = dot['center'][1]
             avg_y = current_line_y_sum / len(current_line)
-            if abs(dy - avg_y) < avg_radius * 3.0: # 行間判定
+            if abs(dy - avg_y) < avg_radius * 3.0: 
                 current_line.append(dot)
                 current_line_y_sum += dy
             else:
@@ -128,13 +128,10 @@ def process_braille_image(image_array):
     for line_dots in lines_of_dots:
         if not line_dots: continue
         
-        # 行のY中心を固定 (垂直等間隔の基礎)
         line_center_y = np.median([d['center'][1] for d in line_dots])
-        
         line_dots.sort(key=lambda d: d['center'][0])
         dots_x = np.array([d['center'][0] for d in line_dots])
 
-        # 文字グループ化
         x_diffs = np.diff(dots_x)
         gap_threshold = avg_radius * 4.5
         groups = []
@@ -147,55 +144,50 @@ def process_braille_image(image_array):
                 current_group = [line_dots[i+1]]
         groups.append(current_group)
 
-        # --- 【核心】完全等間隔グリッドの計算 ---
+        # グリッド計算
         group_starts = np.array([min([d['center'][0] for d in g]) for g in groups])
         
-        # 1. 平均的な文字ピッチを推定
         estimated_pitch = avg_radius * 6.0
         if len(group_starts) > 1:
             diffs = np.diff(group_starts)
             valid_diffs = diffs[diffs > avg_radius * 4.0]
             if len(valid_diffs) > 0:
-                estimated_pitch = np.percentile(valid_diffs, 25) # 最小頻出値をベースに
+                estimated_pitch = np.percentile(valid_diffs, 25)
 
-        # 2. 各グループに「グリッド番号」を割り振る (0, 1, 2, 4, 5...)
         base_x = group_starts[0]
         indices = np.round((group_starts - base_x) / estimated_pitch)
         
-        # 3. 線形回帰で「理想のピッチ」と「開始位置」を算出
-        # y = ax + b (y:実座標, x:インデックス) -> 傾きaが厳密なピッチ
+        # 線形回帰 (エラー回避付き)
+        PERFECT_PITCH = estimated_pitch
+        PERFECT_START = base_x
+        
         if len(indices) >= 2:
-            slope, intercept = np.polyfit(indices, group_starts, 1)
-            PERFECT_PITCH = slope
-            PERFECT_START = intercept
-        else:
-            PERFECT_PITCH = estimated_pitch
-            PERFECT_START = base_x
+            try:
+                slope, intercept = np.polyfit(indices, group_starts, 1)
+                PERFECT_PITCH = slope
+                PERFECT_START = intercept
+            except:
+                pass
 
-        # 4. 縦ピッチ決定
         y_dists = [abs(d['center'][1] - line_center_y) for d in line_dots]
         valid_y = [dy for dy in y_dists if dy > avg_radius * 0.5]
         v_pitch = np.median(valid_y) if valid_y else avg_radius * 2.5
 
-        # 5. セル生成 (インデックスに基づいてループ)
-        start_idx = int(min(indices))
-        end_idx = int(max(indices))
+        # セル生成
+        start_idx = int(min(indices)) if len(indices)>0 else 0
+        end_idx = int(max(indices)) if len(indices)>0 else 0
         
-        # 固定セルサイズ
-        FIXED_W = int(PERFECT_PITCH * 0.75) # ピッチより少し小さくして重なり防止
+        FIXED_W = int(PERFECT_PITCH * 0.75)
         FIXED_H = int(v_pitch * 2 + avg_radius * 3)
         INTRA_PITCH = avg_radius * 2.5
 
         for idx in range(start_idx, end_idx + 1):
-            # 数学的に計算された完全な座標
             cell_left = PERFECT_START + (idx * PERFECT_PITCH)
-            cell_center_x = cell_left + (PERFECT_PITCH * 0.4) # 中心を少し右へ
+            cell_center_x = cell_left + (PERFECT_PITCH * 0.4) 
             
-            # 左列・右列のターゲット位置 (固定)
             t_col1 = cell_center_x - (INTRA_PITCH / 2)
             t_col2 = cell_center_x + (INTRA_PITCH / 2)
             
-            # ターゲットY座標
             t_y1 = line_center_y - v_pitch
             t_y2 = line_center_y
             t_y3 = line_center_y + v_pitch
@@ -205,37 +197,29 @@ def process_braille_image(image_array):
                 (t_col2, t_y1), (t_col2, t_y2), (t_col2, t_y3)
             ]
             
-            # ドット吸着
             pattern = [False] * 6
             has_dot = False
             
-            # このセルの領域にあるドットを検索
             search_x_min = cell_left - (PERFECT_PITCH * 0.1)
             search_x_max = cell_left + (PERFECT_PITCH * 0.9)
-            
             local_dots = [d for d in line_dots if search_x_min < d['center'][0] < search_x_max]
             
             for dot in local_dots:
                 if dot['id'] in used_dot_ids: continue
-                
                 dx, dy = dot['center']
                 min_dist = float('inf')
                 best_idx = -1
-                
                 for ti, (tx, ty) in enumerate(targets):
-                    # Y方向の判定を少し甘く
                     dist = np.sqrt((dx - tx)**2 + ((dy - ty)*0.8)**2)
                     if dist < min_dist:
                         min_dist = dist
                         best_idx = ti
                 
-                # 判定範囲 (固定ピッチ内なら吸着)
                 if min_dist < avg_radius * 3.5:
                     pattern[best_idx] = True
                     has_dot = True
                     used_dot_ids.add(dot['id'])
 
-            # 描画用矩形 (完全に固定サイズ・固定間隔)
             anchor_x = int(cell_center_x - (FIXED_W / 2))
             anchor_y = int(line_center_y - (FIXED_H / 2))
             
@@ -282,9 +266,26 @@ def process_braille_image(image_array):
     mode_num, mode_dak, mode_han, mode_yoon = False, False, False, False
     cell_details = []
 
+    # --- 【追加】結果画像作成 ---
+    # ここが抜けていたため NameError になっていました
+    result_img = cv2.cvtColor(corrected_img, cv2.COLOR_GRAY2RGB)
+
     for cell in braille_cells:
-        if cell.get('is_newline'): final_text += "\n"; continue
-        if cell.get('is_space'): final_text += "　"; mode_num = False; continue
+        if cell.get('is_newline'): 
+            final_text += "\n"
+            continue
+        
+        rx, ry, rw, rh = map(int, cell['rect'])
+        
+        if cell.get('is_space'):
+            final_text += "　"
+            mode_num = False
+            # 空白セル描画 (黄色)
+            cv2.rectangle(result_img, (rx, ry), (rx+rw, ry+rh), (0, 255, 255), 1)
+            continue
+        
+        # 文字セル描画 (青)
+        cv2.rectangle(result_img, (rx, ry), (rx+rw, ry+rh), (255, 0, 0), 2)
         
         dots = get_dots_tuple(cell['pattern'])
         char_raw = "?"
@@ -305,6 +306,10 @@ def process_braille_image(image_array):
             if mode_dak: char_raw = dakuten_map.get(char_raw, char_raw + "゛"); mode_dak = False
             elif mode_han: char_raw = handaku_map.get(char_raw, char_raw + "゜"); mode_han = False
             final_text += char_raw
+        
+        # ドット番号描画
+        label = "".join(map(str, dots))
+        cv2.putText(result_img, label, (rx, ry-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,200), 2)
         
         p = cell['pattern']
         vis = f"{'●' if p[0] else '○'} {'●' if p[3] else '○'}\n{'●' if p[1] else '○'} {'●' if p[4] else '○'}\n{'●' if p[2] else '○'} {'●' if p[5] else '○'}"
