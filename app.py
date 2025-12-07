@@ -2,7 +2,7 @@ import streamlit as st
 import cv2
 import numpy as np
 from PIL import Image
-from streamlit_cropper import st_cropper # トリミング用ライブラリ
+from streamlit_cropper import st_cropper
 
 # ページ設定
 st.set_page_config(
@@ -10,6 +10,43 @@ st.set_page_config(
     page_icon="🔍",
     layout="centered"
 )
+
+# ==========================================
+# 関数: 画像の傾き補正
+# ==========================================
+def correct_skew(image, contours):
+    # すべての輪郭点を含む最小矩形を取得
+    if not contours:
+        return image, 0
+    
+    all_points = np.concatenate(contours)
+    rect = cv2.minAreaRect(all_points)
+    angle = rect[-1]
+    
+    # 角度の正規化 (OpenCVのバージョンにより異なる場合があるため調整)
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+        
+    # わずかな角度なら補正しない（ノイズ対策）
+    if abs(angle) < 0.5:
+        return image, 0
+
+    (h, w) = image.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    
+    # 回転後の画像サイズ計算（見切れ防止）
+    cos = np.abs(M[0, 0])
+    sin = np.abs(M[0, 1])
+    new_w = int((h * sin) + (w * cos))
+    new_h = int((h * cos) + (w * sin))
+    M[0, 2] += (new_w / 2) - center[0]
+    M[1, 2] += (new_h / 2) - center[1]
+
+    rotated = cv2.warpAffine(image, M, (new_w, new_h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return rotated, angle
 
 # ==========================================
 # 関数: 点字解析メインロジック
@@ -24,27 +61,42 @@ def process_braille_image(image_array):
     blurred_image = cv2.GaussianBlur(gray_image, (5, 5), 0)
     thresh_image = cv2.adaptiveThreshold(blurred_image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
 
-    # 2. ドット検出
+    # 2. 一次ドット検出 (傾き検出用)
     contours, _ = cv2.findContours(thresh_image, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     
+    # --- 【追加】傾き補正 ---
+    # ドットと思われる輪郭だけを集めて角度を計算
+    dot_contours = []
+    for cnt in contours:
+        if 10 < cv2.contourArea(cnt) < 5000:
+            dot_contours.append(cnt)
+            
+    corrected_img, angle = correct_skew(gray_image, dot_contours)
+    
+    # 補正後の画像で再処理
+    blurred_corr = cv2.GaussianBlur(corrected_img, (5, 5), 0)
+    thresh_corr = cv2.adaptiveThreshold(blurred_corr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+    contours_final, _ = cv2.findContours(thresh_corr, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    # 3. 本番ドット検出
     raw_dots = []
     radii_list = []
     dot_id_counter = 0
 
-    for contour in contours:
+    for contour in contours_final:
         area = cv2.contourArea(contour)
-        if 3 < area < 5000: # 範囲調整
+        if 3 < area < 5000: 
             (x, y), radius = cv2.minEnclosingCircle(contour)
             center = (int(x), int(y))
             
             # 白抜き・ハイフンチェック
             x_r, y_r, w_r, h_r = cv2.boundingRect(contour)
             aspect_ratio = float(w_r) / h_r
-            if aspect_ratio > 1.6 or aspect_ratio < 0.6: continue
+            if aspect_ratio > 1.8 or aspect_ratio < 0.5: continue
 
-            mask = np.zeros(thresh_image.shape, dtype=np.uint8)
+            mask = np.zeros(thresh_corr.shape, dtype=np.uint8)
             cv2.circle(mask, center, int(radius), 255, -1)
-            mean_val = cv2.mean(thresh_image, mask=mask)[0]
+            mean_val = cv2.mean(thresh_corr, mask=mask)[0]
             if mean_val < 130: continue 
 
             raw_dots.append({'id': dot_id_counter, 'center': center, 'radius': radius})
@@ -52,9 +104,9 @@ def process_braille_image(image_array):
             dot_id_counter += 1
 
     if not raw_dots:
-        return image_array, "ドットが見つかりませんでした。", []
+        return corrected_img, "ドットが見つかりませんでした。", []
 
-    # 基準半径の決定
+    # 基準半径
     median_radius = np.median(radii_list)
     braille_dots = []
     valid_radii = []
@@ -64,34 +116,54 @@ def process_braille_image(image_array):
             valid_radii.append(dot['radius'])
     
     if not braille_dots:
-        return image_array, "有効なドットが見つかりませんでした。", []
+        return corrected_img, "有効なドットが見つかりませんでした。", []
 
     avg_radius = np.mean(valid_radii)
 
-    # 3. グリッド解析 (尺取り虫方式)
-    dots_y = np.array([d['center'][1] for d in braille_dots])
-    dots_y_sorted = np.sort(dots_y)
-    y_diffs = np.diff(dots_y_sorted)
-    line_separators = np.where(y_diffs > avg_radius * 3.5)[0]
+    # 4. グリッド解析 (行認識強化版)
     
-    line_y_centers = []
-    start_idx = 0
-    for sep_idx in line_separators:
-        end_idx = sep_idx + 1
-        line_y_centers.append(np.median(dots_y_sorted[start_idx:end_idx]))
-        start_idx = end_idx
-    line_y_centers.append(np.median(dots_y_sorted[start_idx:]))
+    # --- 【修正】行のクラスタリング ---
+    # Y座標でソート
+    braille_dots.sort(key=lambda d: d['center'][1])
+    
+    lines_of_dots = []
+    if braille_dots:
+        current_line = [braille_dots[0]]
+        current_line_y_sum = braille_dots[0]['center'][1]
+        
+        for i in range(1, len(braille_dots)):
+            dot = braille_dots[i]
+            dy = dot['center'][1]
+            
+            # 現在の行の平均Y座標
+            current_line_avg_y = current_line_y_sum / len(current_line)
+            
+            # 平均との差が 半径*2.5 以内なら同じ行とみなす
+            if abs(dy - current_line_avg_y) < avg_radius * 2.5:
+                current_line.append(dot)
+                current_line_y_sum += dy
+            else:
+                # 新しい行へ
+                lines_of_dots.append(current_line)
+                current_line = [dot]
+                current_line_y_sum = dy
+        lines_of_dots.append(current_line)
 
     braille_cells = []
     used_dot_ids = set()
 
-    for line_center_y in line_y_centers:
-        line_dots = [d for d in braille_dots if abs(d['center'][1] - line_center_y) < avg_radius * 4]
+    # 各行ごとの処理
+    for line_dots in lines_of_dots:
         if not line_dots: continue
         
+        # 行のY中心を再計算
+        line_center_y = np.median([d['center'][1] for d in line_dots])
+        
+        # X座標でソート
         line_dots.sort(key=lambda d: d['center'][0])
         dots_x = np.array([d['center'][0] for d in line_dots])
 
+        # 文字グループ化
         x_diffs = np.diff(dots_x)
         gap_threshold = avg_radius * 4.5
         
@@ -105,6 +177,7 @@ def process_braille_image(image_array):
                 current_group = [line_dots[i+1]]
         groups.append(current_group)
 
+        # ピッチ推定
         group_starts = np.array([min([d['center'][0] for d in g]) for g in groups])
         estimated_pitch = avg_radius * 6.0
         if len(group_starts) > 1:
@@ -113,6 +186,7 @@ def process_braille_image(image_array):
             if len(valid_diffs) > 0:
                 estimated_pitch = np.percentile(valid_diffs, 25)
 
+        # 縦ピッチ
         y_dists = [abs(d['center'][1] - line_center_y) for d in line_dots]
         valid_y = [dy for dy in y_dists if dy > avg_radius * 0.5]
         v_pitch = np.median(valid_y) if valid_y else avg_radius * 2.5
@@ -122,6 +196,7 @@ def process_braille_image(image_array):
         intra_pitch = avg_radius * 2.5
         cursor_x = group_starts[0]
         
+        # 尺取り虫ロジック
         for grp in groups:
             min_x = min([d['center'][0] for d in grp])
             max_x = max([d['center'][0] for d in grp])
@@ -197,7 +272,7 @@ def process_braille_image(image_array):
 
         braille_cells.append({'is_newline': True})
 
-    # 4. 翻訳と可視化
+    # 5. 翻訳と可視化
     def get_dots_tuple(bool_pattern):
         return tuple(i + 1 for i, b in enumerate(bool_pattern) if b)
 
@@ -233,7 +308,8 @@ def process_braille_image(image_array):
     final_text = ""
     mode_number = False; mode_dakuten = False; mode_handakuten = False; mode_yoon = False
     
-    result_img = image_array.copy()
+    # 補正後の画像をRGB変換して使用
+    result_img = cv2.cvtColor(corrected_img, cv2.COLOR_GRAY2RGB)
     cell_details = []
 
     for cell in braille_cells:
@@ -274,15 +350,12 @@ def process_braille_image(image_array):
             
             final_text += char_raw
         
-        # 可視化：認識ドット
         label = "".join(map(str, dots))
         cv2.putText(result_img, label, (rx, ry-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,200), 2)
         
-        # 可視化：ターゲット
         for tx, ty in cell['targets']:
             cv2.circle(result_img, (int(tx), int(ty)), 2, (0, 0, 255), 1)
 
-        # 詳細ログ
         p = cell['pattern']
         dot_visual =  f" {'●' if p[0] else '○'} {'●' if p[3] else '○'}\n {'●' if p[1] else '○'} {'●' if p[4] else '○'}\n {'●' if p[2] else '○'} {'●' if p[5] else '○'}"
         cell_details.append({'char': char_raw, 'dots': dots, 'visual': dot_visual})
@@ -320,15 +393,12 @@ if uploaded_file is not None:
             with st.spinner("解析中..."):
                 result_img, text, details = process_braille_image(img_cv)
                 
-                # 結果表示用にRGBに戻す
-                result_img_rgb = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
-                
                 st.success("完了！")
                 
                 col1, col2 = st.columns([1, 1])
                 
                 with col1:
-                    st.image(result_img_rgb, caption="解析結果", use_column_width=True)
+                    st.image(result_img, caption="解析結果", use_column_width=True)
                 
                 with col2:
                     st.text_area("翻訳テキスト", text, height=200)
