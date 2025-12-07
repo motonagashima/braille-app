@@ -365,7 +365,7 @@ def process_braille_image(image_array):
 # ==========================================
 # Streamlit UI
 # ==========================================
-st.title("点字翻訳アプリ (Braille Reader)")
+st.title("点字翻訳アプリ (Braille Reader)v1")
 st.write("画像の点字部分をトリミングして翻訳します。")
 
 uploaded_file = st.file_uploader("画像ファイルを選択してください", type=["jpg", "jpeg", "png"])
