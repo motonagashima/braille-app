@@ -2,6 +2,14 @@ import streamlit as st
 import cv2
 import numpy as np
 from PIL import Image
+from streamlit_cropper import st_cropper # トリミング用ライブラリ
+
+# ページ設定
+st.set_page_config(
+    page_title="Braille Reader",
+    page_icon="🔍",
+    layout="centered"
+)
 
 # ==========================================
 # 関数: 点字解析メインロジック
@@ -285,40 +293,48 @@ def process_braille_image(image_array):
 # Streamlit UI
 # ==========================================
 st.title("点字翻訳アプリ (Braille Reader)")
-st.write("点字の画像をアップロードすると、日本語に翻訳します。")
+st.write("画像の点字部分をトリミングして翻訳します。")
 
 uploaded_file = st.file_uploader("画像ファイルを選択してください", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
-    # 画像読み込み
     image = Image.open(uploaded_file)
-    img_array = np.array(image)
     
-    # OpenCV用にBGR変換 (PILはRGB)
-    if len(img_array.shape) == 3:
-        img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-    else:
-        img_cv = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
+    st.subheader("1. 範囲指定")
+    st.write("翻訳したい点字の部分を枠で囲んでください。")
+    
+    # トリミングコンポーネント (box_color='blue'で見やすく)
+    cropped_img = st_cropper(image, realtime_update=True, box_color='#0000FF', aspect_ratio=None)
+    
+    st.subheader("2. 翻訳")
+    if st.button("この範囲を翻訳する"):
+        if cropped_img is not None:
+            # PIL -> OpenCV (numpy) 変換
+            img_array = np.array(cropped_img)
+            # RGB -> BGR (OpenCV用)
+            if len(img_array.shape) == 3:
+                img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+            else:
+                img_cv = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
 
-    st.image(image, caption="アップロードされた画像", use_column_width=True)
-    
-    if st.button("翻訳する"):
-        with st.spinner("解析中..."):
-            result_img, text, details = process_braille_image(img_cv)
-            
-            # 結果表示用にRGBに戻す
-            result_img_rgb = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
-            
-            st.success("翻訳完了！")
-            
-            st.subheader("解析画像")
-            st.image(result_img_rgb, caption="認識結果（青枠:文字, 黄枠:空白）", use_column_width=True)
-            
-            st.subheader("翻訳テキスト")
-            st.text_area("", text, height=100)
-            
-            with st.expander("詳細レポートを見る"):
-                for i, det in enumerate(details):
-                    st.text(f"[Cell {i+1:02d}] 文字: {det['char']}  ドット: {det['dots']}")
-                    st.text(det['visual'])
-                    st.divider()
+            with st.spinner("解析中..."):
+                result_img, text, details = process_braille_image(img_cv)
+                
+                # 結果表示用にRGBに戻す
+                result_img_rgb = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
+                
+                st.success("完了！")
+                
+                col1, col2 = st.columns([1, 1])
+                
+                with col1:
+                    st.image(result_img_rgb, caption="解析結果", use_column_width=True)
+                
+                with col2:
+                    st.text_area("翻訳テキスト", text, height=200)
+                
+                with st.expander("詳細レポートを見る"):
+                    for i, det in enumerate(details):
+                        st.text(f"[{i+1:02d}] {det['char']} (ドット: {det['dots']})")
+                        st.text(det['visual'])
+                        st.divider()
